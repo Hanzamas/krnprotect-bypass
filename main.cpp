@@ -243,6 +243,113 @@ static bool PatchJumpRel32(PBYTE from, PBYTE to)
     return PatchBytes(from, patch, 5);
 }
 
+// ---- IAT hook (Import Address Table) -----------------------------------
+// Handler pengganti ExitProcess: log lalu sleep forever supaya thread caller
+// tidak pernah kembali ke logic exit. Process tetap hidup.
+typedef VOID (WINAPI *PFN_ExitProcess)(UINT);
+typedef BOOL (WINAPI *PFN_TerminateProcess)(HANDLE, UINT);
+
+static volatile bool g_exitBlocked = false;
+
+// Kill-switch: kalau file `bypass_off.txt` ada di folder kerja, hook
+// auto-bypass dan biarkan exit normal. Berguna saat user mau menutup game.
+static bool ShouldAllowExit()
+{
+    DWORD attr = GetFileAttributesA("bypass_off.txt");
+    return attr != INVALID_FILE_ATTRIBUTES;
+}
+
+static VOID WINAPI MyExitProcess(UINT uExitCode)
+{
+    if (ShouldAllowExit()) {
+        Log("MyExitProcess: bypass_off.txt found, allowing exit code=%u", uExitCode);
+        ExitProcess(uExitCode);
+    }
+    Log("!!! MyExitProcess intercepted, uExitCode=%u (BLOCKING; create bypass_off.txt to allow)", uExitCode);
+    g_exitBlocked = true;
+    // Sleep tapi periodik cek kill-switch supaya user bisa unblock kapan saja.
+    while (1) {
+        Sleep(2000);
+        if (ShouldAllowExit()) {
+            Log("MyExitProcess: kill-switch detected, releasing");
+            ExitProcess(uExitCode);
+        }
+    }
+}
+
+static BOOL WINAPI MyTerminateProcess(HANDLE hProc, UINT uExitCode)
+{
+    if (hProc == GetCurrentProcess() || hProc == (HANDLE)-1) {
+        if (ShouldAllowExit()) {
+            Log("MyTerminateProcess: bypass_off.txt found, allowing self-terminate");
+            return TerminateProcess(hProc, uExitCode);
+        }
+        Log("!!! MyTerminateProcess on self intercepted, code=%u (BLOCKING)", uExitCode);
+        g_exitBlocked = true;
+        while (1) {
+            Sleep(2000);
+            if (ShouldAllowExit()) {
+                Log("MyTerminateProcess: kill-switch detected, releasing");
+                return TerminateProcess(hProc, uExitCode);
+            }
+        }
+    }
+    // Pass-through untuk handle lain (mis. GameGuard.des).
+    return TerminateProcess(hProc, uExitCode);
+}
+
+// Hook 1 entry IAT di module hMod yang import nama `funcName` dari `dllName`.
+static bool HookIAT(HMODULE hMod, const char* dllName, const char* funcName, void* newFunc)
+{
+    PBYTE base = (PBYTE)hMod;
+    PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)base;
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return false;
+    PIMAGE_NT_HEADERS nt = (PIMAGE_NT_HEADERS)(base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return false;
+
+    DWORD iatRVA = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress;
+    if (!iatRVA) return false;
+
+    PIMAGE_IMPORT_DESCRIPTOR imp = (PIMAGE_IMPORT_DESCRIPTOR)(base + iatRVA);
+    while (imp->Name) {
+        const char* impName = (const char*)(base + imp->Name);
+        if (_stricmp(impName, dllName) == 0) {
+            PIMAGE_THUNK_DATA orig = imp->OriginalFirstThunk
+                ? (PIMAGE_THUNK_DATA)(base + imp->OriginalFirstThunk)
+                : (PIMAGE_THUNK_DATA)(base + imp->FirstThunk);
+            PIMAGE_THUNK_DATA iat = (PIMAGE_THUNK_DATA)(base + imp->FirstThunk);
+
+            for (; orig->u1.AddressOfData; orig++, iat++) {
+                if (IMAGE_SNAP_BY_ORDINAL(orig->u1.Ordinal)) continue;
+                PIMAGE_IMPORT_BY_NAME imn = (PIMAGE_IMPORT_BY_NAME)(base + orig->u1.AddressOfData);
+                if (strcmp((const char*)imn->Name, funcName) == 0) {
+                    DWORD oldProt = 0, tmp = 0;
+                    if (!VirtualProtect(&iat->u1.Function, sizeof(DWORD_PTR),
+                                        PAGE_READWRITE, &oldProt)) return false;
+                    iat->u1.Function = (DWORD_PTR)newFunc;
+                    VirtualProtect(&iat->u1.Function, sizeof(DWORD_PTR), oldProt, &tmp);
+                    Log("IAT hook: %s!%s -> %p OK", dllName, funcName, newFunc);
+                    return true;
+                }
+            }
+        }
+        imp++;
+    }
+    return false;
+}
+
+// Pasang hook untuk fungsi exit yang kemungkinan dipanggil.
+static void InstallExitHooks(HMODULE hMain)
+{
+    // kernel32.dll
+    HookIAT(hMain, "kernel32.dll", "ExitProcess",      (void*)MyExitProcess);
+    HookIAT(hMain, "KERNEL32.dll", "ExitProcess",      (void*)MyExitProcess);
+    HookIAT(hMain, "kernel32.dll", "TerminateProcess", (void*)MyTerminateProcess);
+    HookIAT(hMain, "KERNEL32.dll", "TerminateProcess", (void*)MyTerminateProcess);
+    // ntdll redirect (kadang dipanggil langsung)
+    HookIAT(hMain, "ntdll.dll",    "RtlExitUserProcess", (void*)MyExitProcess);
+}
+
 // ---- Patch via string xref ---------------------------------------------
 // Verbose: kalau true, log full detail. Kalau false, log ringkas (cocok untuk
 // scan banyak ExitProgram-N).
@@ -307,6 +414,10 @@ static DWORD WINAPI ScanWorker(LPVOID)
         return 0;
     }
     Log("lostsaga.exe: base=%p size=%lu (0x%lX)", base, size, size);
+
+    // Pasang hook IAT untuk ExitProcess / TerminateProcess SEDINI mungkin
+    // supaya semua exit path ke kernel32 di-block, regardless of source.
+    InstallExitHooks((HMODULE)base);
 
     // Track patched targets to avoid double work.
     bool got_gameMon = false;
