@@ -26,8 +26,8 @@ static void NProtectBypass()
     while (1)
     {
         if (Tools->TerminateProcessByName("GameGuard.des")) {
-            Framework->DetourFunction((PBYTE)nInitStart, (DWORD)nInitComplete, 5);
-            Framework->DetourFunction((PBYTE)n23, (DWORD)n23JMP, 5);
+            Framework->DetourFunction((PBYTE)nInitStart2, (DWORD)nInitComplete, 5);
+            Framework->DetourFunction((PBYTE)n23JE, (DWORD)n23JMP, 5);
             Framework->DetourFunction((PBYTE)n24, (DWORD)n24JMP, 5);
         }
 
