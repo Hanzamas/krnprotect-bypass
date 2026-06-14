@@ -249,7 +249,44 @@ static bool PatchJumpRel32(PBYTE from, PBYTE to)
 typedef VOID (WINAPI *PFN_ExitProcess)(UINT);
 typedef BOOL (WINAPI *PFN_TerminateProcess)(HANDLE, UINT);
 
-static volatile bool g_exitBlocked = false;
+static LONG WINAPI MyVEH(PEXCEPTION_POINTERS info)
+{
+    EXCEPTION_RECORD* rec = info->ExceptionRecord;
+    CONTEXT* ctx = info->ContextRecord;
+
+    const char* name = "UNKNOWN";
+    switch (rec->ExceptionCode) {
+        case EXCEPTION_ACCESS_VIOLATION:    name = "ACCESS_VIOLATION";    break;
+        case EXCEPTION_ILLEGAL_INSTRUCTION: name = "ILLEGAL_INSTRUCTION"; break;
+        case EXCEPTION_STACK_OVERFLOW:      name = "STACK_OVERFLOW";      break;
+        case EXCEPTION_BREAKPOINT:          name = "BREAKPOINT";          break;
+        case EXCEPTION_INT_DIVIDE_BY_ZERO:  name = "DIV_BY_ZERO";         break;
+        case 0xE06D7363:                    name = "C++_EXCEPTION";       break;
+    }
+
+    Log("VEH: code=0x%08lX (%s) at %p", rec->ExceptionCode, name, rec->ExceptionAddress);
+    if (rec->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && rec->NumberParameters >= 2) {
+        const char* op = rec->ExceptionInformation[0] == 0 ? "READ" :
+                         rec->ExceptionInformation[0] == 1 ? "WRITE" : "EXEC";
+        Log("  AV: %s @ %p", op, (void*)rec->ExceptionInformation[1]);
+    }
+    Log("  EIP=%p ESP=%p EBP=%p EAX=%p ECX=%p EDX=%p",
+        (void*)ctx->Eip, (void*)ctx->Esp, (void*)ctx->Ebp,
+        (void*)ctx->Eax, (void*)ctx->Ecx, (void*)ctx->Edx);
+
+    // Dump 16 bytes di EIP supaya kita liat instruksi yang crash.
+    PBYTE eip = (PBYTE)ctx->Eip;
+    __try {
+        Log("  bytes@EIP: %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X",
+            eip[0],eip[1],eip[2],eip[3],eip[4],eip[5],eip[6],eip[7],
+            eip[8],eip[9],eip[10],eip[11],eip[12],eip[13],eip[14],eip[15]);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        Log("  bytes@EIP: <unreadable>");
+    }
+
+    // Tetap forward ke handler default supaya WerFault juga jalan.
+    return EXCEPTION_CONTINUE_SEARCH;
+}
 
 // Kill-switch: kalau file `bypass_off.txt` ada di folder kerja, hook
 // auto-bypass dan biarkan exit normal. Berguna saat user mau menutup game.
@@ -258,6 +295,8 @@ static bool ShouldAllowExit()
     DWORD attr = GetFileAttributesA("bypass_off.txt");
     return attr != INVALID_FILE_ATTRIBUTES;
 }
+
+static volatile bool g_exitBlocked = false;
 
 static VOID WINAPI MyExitProcess(UINT uExitCode)
 {
@@ -462,6 +501,10 @@ static DWORD WINAPI ScanWorker(LPVOID)
     }
     Log("lostsaga.exe: base=%p size=%lu (0x%lX)", base, size, size);
 
+    // Register VEH ASAP supaya tangkap setiap exception di lostsaga.exe.
+    AddVectoredExceptionHandler(1, MyVEH);
+    Log("VEH registered");
+
     // Pasang hook IAT untuk ExitProcess / TerminateProcess SEDINI mungkin
     // supaya semua exit path ke kernel32 di-block, regardless of source.
     InstallExitHooks((HMODULE)base);
@@ -473,45 +516,21 @@ static DWORD WINAPI ScanWorker(LPVOID)
     bool got_exitN[64] = {0}; // index by N (1..63)
 
     for (int attempt = 0; attempt < 240; ++attempt) {
-        // Patch SEMUA ExitProgram - N variants (1..50).
-        for (int n = 1; n <= 50; ++n) {
-            if (got_exitN[n]) continue;
-            char buf[32];
-            sprintf(buf, "ExitProgram - %d", n);
-            char tag[32];
-            sprintf(tag, "ExitProg%d", n);
-            if (PatchFuncByString(tag, base, size, buf, true))
-                got_exitN[n] = true;
-        }
-
-        if (!got_gameMon &&
-            PatchFuncByString("GameMonErr", base, size, "GameMon Error : %d", true))
-            got_gameMon = true;
-
-        if (!got_npr &&
-            PatchFuncByString("nProtect", base, size, "[nProtect] - ", true))
-            got_npr = true;
-
-        // Sekali saja: dump strings di region 1KB dekat ExitProg23 untuk
-        // discovery string lain (debug only, attempt #2 supaya unpacker selesai).
-        if (attempt == 2) {
-            PBYTE eg23 = FindStrZ(base, size, "ExitProgram - 23");
-            if (eg23) {
-                Log("dumping strings around ExitProgram-23 region:");
-                DumpStringsIn(eg23 - 0x80, 0x400);
-            }
-        }
-
-        // Hitung total exit patched.
-        int exitPatched = 0;
-        for (int n = 1; n <= 50; ++n) if (got_exitN[n]) exitPatched++;
+        // PATCHES DISABLED -- "ExitProgram - N" ternyata DEBUG MARKERS dalam
+        // fungsi init normal (string diikuti oleh nama class kayak
+        // "ioApplication::OnXxx"), bukan exit reasons. Patch fungsi-fungsi
+        // ini malah merusak alur init game. Kita biarkan ExitProcess hook
+        // & VEH yang menangani crash/exit; patches dimatikan.
+        //
+        // for (int n = 1; n <= 50; ++n) { ... }
+        // PatchFuncByString("GameMonErr", ...);
+        // PatchFuncByString("nProtect",   ...);
 
         if ((attempt % 8) == 0) {
-            Log("attempt #%d: gameMon=%d npr=%d exitN_patched=%d",
-                attempt, got_gameMon, got_npr, exitPatched);
+            Log("attempt #%d: scan worker idle (patches disabled, waiting)",
+                attempt);
         }
-
-        Sleep(250);
+        Sleep(2000);
     }
 
     Log("scan worker timeout");
