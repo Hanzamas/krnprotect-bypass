@@ -249,10 +249,30 @@ static bool PatchJumpRel32(PBYTE from, PBYTE to)
 typedef VOID (WINAPI *PFN_ExitProcess)(UINT);
 typedef BOOL (WINAPI *PFN_TerminateProcess)(HANDLE, UINT);
 
+// Empty string buffer untuk substitusi NULL pointer dereference.
+// Caller yang panggil string function dengan NULL akan diarahkan ke sini.
+static const char g_emptyStr[64] = {0}; // semua null
+
+// ---- VEH (Vectored Exception Handler) ----------------------------------
+// Log SETIAP exception yang terjadi di lostsaga.exe. Bisa pinpoint alamat
+// crash supaya kita tau apa yang sebenarnya gagal.
+//
+// Hatch: kalau access-violation karena NULL pointer pada strlen-style
+// loop, redirect register sumber ke empty string dan resume eksekusi.
 static LONG WINAPI MyVEH(PEXCEPTION_POINTERS info)
 {
     EXCEPTION_RECORD* rec = info->ExceptionRecord;
     CONTEXT* ctx = info->ContextRecord;
+
+    // Skip noise: VMProtect/Themida pakai privileged-instruction & illegal-
+    // instruction sebagai trampoline. Forward tanpa log supaya log tidak
+    // banjir.
+    if (rec->ExceptionCode == 0xC0000096 ||  // PRIVILEGED_INSTRUCTION
+        rec->ExceptionCode == 0xC000001D ||  // ILLEGAL_INSTRUCTION
+        rec->ExceptionCode == 0x40010006 ||  // DBG_PRINTEXCEPTION_C
+        rec->ExceptionCode == EXCEPTION_BREAKPOINT) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
 
     const char* name = "UNKNOWN";
     switch (rec->ExceptionCode) {
@@ -284,7 +304,53 @@ static LONG WINAPI MyVEH(PEXCEPTION_POINTERS info)
         Log("  bytes@EIP: <unreadable>");
     }
 
-    // Tetap forward ke handler default supaya WerFault juga jalan.
+    // ---- Hatch: NULL deref pada string-loop ----
+    // Pattern paling umum yang kita lihat: `8A 08` (mov cl, [eax]) dengan
+    // EAX = 0. Bisa juga register lain. Untuk setiap pola umum, redirect
+    // register source ke buffer kosong dan resume.
+    if (rec->ExceptionCode == EXCEPTION_ACCESS_VIOLATION
+        && rec->ExceptionInformation[0] == 0   // READ
+        && rec->ExceptionInformation[1] == 0)  // @ NULL
+    {
+        DWORD emptyAddr = (DWORD)(DWORD_PTR)g_emptyStr;
+        bool fixed = false;
+        __try {
+            // mov cl/dl/bl/...(8-bit) atau mov reg32, [reg]
+            // 8A 08 = mov cl, [eax]
+            // 8A 0A = mov cl, [edx]
+            // 8A 0E = mov cl, [esi]
+            // 8A 0F = mov cl, [edi]
+            // 8B 08 = mov ecx, [eax]
+            // 8B 1A = mov ebx, [edx]
+            // dll. ModR/M byte: top 2 bits=00 (no displacement),
+            //    middle 3=dest reg, bottom 3=base reg
+            BYTE op = eip[0];
+            BYTE mrm = eip[1];
+            // Hanya handle bila MOD=00 (no displacement, register-indirect).
+            if ((mrm & 0xC0) == 0x00 && (op == 0x8A || op == 0x8B || op == 0x80 || op == 0x81)) {
+                BYTE rmReg = mrm & 0x07; // 0=EAX, 1=ECX, 2=EDX, 3=EBX, 4=ESP, 5=EBP, 6=ESI, 7=EDI
+                DWORD* regs[8] = {
+                    &ctx->Eax, &ctx->Ecx, &ctx->Edx, &ctx->Ebx,
+                    &ctx->Esp, &ctx->Ebp, &ctx->Esi, &ctx->Edi
+                };
+                if (rmReg < 8 && rmReg != 4 && rmReg != 5) {
+                    DWORD oldVal = *regs[rmReg];
+                    if (oldVal == 0) {
+                        *regs[rmReg] = emptyAddr;
+                        Log("  HATCH: register #%d was NULL, redirected to empty string @ %p",
+                            rmReg, (void*)emptyAddr);
+                        fixed = true;
+                    }
+                }
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {}
+
+        if (fixed) {
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+    }
+
+    // Tetap forward ke handler default supaya VEH packer juga jalan.
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
