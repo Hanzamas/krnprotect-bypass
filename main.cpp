@@ -26,16 +26,11 @@ static void NProtectBypass()
     while (1)
     {
         if (Tools->TerminateProcessByName("GameGuard.des")) {
-            // DetourFunction sementara dinonaktifkan untuk isolasi:
-            // bila lostsaga.exe tetap crash hanya dengan terminate GameGuard.des,
-            // berarti masalah bukan di patch kode (offset). Bila lostsaga
-            // bertahan, berarti offset di Offset.h tidak cocok dengan build
-            // yang dipakai dan harus dicari ulang via AOB scan.
-            //
-            // Framework->DetourFunction((PBYTE)nInitStart2, (DWORD)nInitComplete, 5);
-            // Framework->DetourFunction((PBYTE)n23JE, (DWORD)n23JMP, 5);
-            // Framework->DetourFunction((PBYTE)n24, (DWORD)n24JMP, 5);
-            (void)Framework;
+            // Patch internal nProtect check di lostsaga.exe.
+            // Offset di Offset.h diisi untuk build KR 2025.
+            Framework->DetourFunction((PBYTE)nInitStart2, (DWORD)nInitComplete, 5);
+            Framework->DetourFunction((PBYTE)n23JE, (DWORD)n23JMP, 5);
+            Framework->DetourFunction((PBYTE)n24, (DWORD)n24JMP, 5);
         }
 
         Sleep(20);
