@@ -7,14 +7,18 @@
 // Proxy DLL untuk Lost Saga (build 12861).
 // Drop sebagai `xinput1_3.dll`; rename DLL asli jadi `xinput1_3_org.dll`.
 //
-// Strategi (terbukti ada di lostsaga.exe via diagnostic sebelumnya):
-//   1. Cari string "GameMon Error : %d" -> error printer GameGuard check
-//   2. Cari string "ExitProgram - 23"   -> exit reason 23 (GG fail)
-//   3. Cari string "ExitProgram - 1"    -> exit reason 1 (variant)
-//   Untuk tiap string: cari semua xref `push <strAddr>` di code,
-//   walk back ke prologue 55 8B EC, patch dengan `xor eax,eax; ret`.
+// lostsaga.exe ter-pack: strings (incl. error message GG) baru ada
+// SETELAH unpacker decrypt section .rdata. Dimana DllMain dipanggil di
+// titik awal, kita harus retry scan sampai strings muncul.
 //
-//   Plus: kill loop GameGuard.des.
+// Strategi:
+//   - Background loop scan tiap 200ms
+//   - Untuk setiap string target: cari -> xref -> walk back ke prologue
+//     -> patch dengan `xor eax,eax; ret`
+//   - Stop setelah semua target ke-patch atau timeout
+//   - Paralel: kill loop GameGuard.des
+//
+// Log: `bypass.log` di folder game.
 // =====================================================================
 
 #pragma comment(linker, "/export:XInputGetState=xinput1_3_org.XInputGetState,@2")
@@ -64,7 +68,7 @@ static void LogHex(const char* tag, const void* data, int n)
     const BYTE* p = (const BYTE*)data;
     for (int i = 0; i < n && pos < (int)sizeof(buf) - 4; ++i)
         pos += sprintf(buf + pos, "%02X ", p[i]);
-    Log("  %s (%p, %d bytes): %s", tag, data, n, buf);
+    Log("  %s: %s", tag, buf);
 }
 
 // ---- Module helpers ----------------------------------------------------
@@ -82,19 +86,42 @@ static bool GetMainModuleRange(PBYTE& base, DWORD& size)
 }
 
 // ---- Pattern utilities -------------------------------------------------
+// Safe-read: pakai SEH/IsBadReadPtr-style guard via VirtualQuery, supaya
+// scan tidak crash bila beberapa page belum committed.
+static bool IsReadable(PBYTE p, DWORD n)
+{
+    MEMORY_BASIC_INFORMATION mbi;
+    if (!VirtualQuery(p, &mbi, sizeof(mbi))) return false;
+    if (mbi.State != MEM_COMMIT) return false;
+    if (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) return false;
+    PBYTE regionEnd = (PBYTE)mbi.BaseAddress + mbi.RegionSize;
+    return (p + n) <= regionEnd;
+}
+
 static PBYTE FindBytes(PBYTE base, DWORD size, const BYTE* pattern, DWORD patSize)
 {
     if (size < patSize) return NULL;
     DWORD last = size - patSize;
-    for (DWORD i = 0; i <= last; ++i) {
+
+    // Scan halaman demi halaman (4KB), skip yang non-committed.
+    const DWORD PAGE = 0x1000;
+    for (DWORD i = 0; i <= last; ) {
+        // Cek apakah pattern bisa muat di sini (cross-page check).
+        if (!IsReadable(base + i, patSize)) {
+            // Skip ke awal halaman berikutnya.
+            DWORD nextPage = ((DWORD)(DWORD_PTR)(base + i) & ~(PAGE - 1)) + PAGE
+                             - (DWORD)(DWORD_PTR)base;
+            if (nextPage <= i) i++;
+            else i = nextPage;
+            continue;
+        }
         if (memcmp(base + i, pattern, patSize) == 0)
             return base + i;
+        i++;
     }
     return NULL;
 }
 
-// Cari string ASCII (sertakan null terminator). Memakai literal C supaya
-// tidak ada risiko salah ketik byte array.
 static PBYTE FindStrZ(PBYTE base, DWORD size, const char* str)
 {
     DWORD len = (DWORD)strlen(str) + 1;
@@ -108,6 +135,7 @@ static PBYTE FindPushImm32_N(PBYTE base, DWORD size, DWORD imm, int nth)
     DWORD last = size - 5;
     int seen = 0;
     for (DWORD i = 0; i <= last; ++i) {
+        if (!IsReadable(base + i, 5)) { i += 0x1000; continue; }
         if (base[i] == 0x68 && *(DWORD*)(base + i + 1) == imm) {
             if (seen == nth) return base + i;
             seen++;
@@ -120,6 +148,7 @@ static PBYTE FindFuncStartBack(PBYTE addr, DWORD maxBack)
 {
     for (DWORD i = 0; i < maxBack; ++i) {
         PBYTE p = addr - i;
+        if (!IsReadable(p, 3)) continue;
         if (p[0] == 0x55 && p[1] == 0x8B && p[2] == 0xEC)
             return p;
     }
@@ -142,16 +171,12 @@ static bool PatchBytes(PBYTE addr, const BYTE* bytes, DWORD len)
 // ---- Patch via string xref ---------------------------------------------
 static bool PatchFuncByString(const char* tag, PBYTE base, DWORD size, const char* str)
 {
-    Log("[%s] looking for '%s' (len=%d incl null)",
-        tag, str, (int)strlen(str) + 1);
-
     PBYTE strAddr = FindStrZ(base, size, str);
-    if (!strAddr) {
-        Log("[%s] string NOT FOUND", tag);
-        return false;
-    }
-    Log("[%s] string at %p (offset 0x%lX)", tag, strAddr, (DWORD)(strAddr - base));
-    LogHex("at-strAddr", strAddr, 32);
+    if (!strAddr) return false;
+
+    Log("[%s] string '%s' at %p (offset 0x%lX)",
+        tag, str, strAddr, (DWORD)(strAddr - base));
+    LogHex("at-strAddr-32B", strAddr, 32);
 
     static const BYTE STUB[] = { 0x31, 0xC0, 0xC3 }; // xor eax,eax; ret
     int xrefIdx = 0, patched = 0;
@@ -166,7 +191,7 @@ static bool PatchFuncByString(const char* tag, PBYTE base, DWORD size, const cha
         } else {
             Log("[%s]   prologue at %p (-%lu from xref)",
                 tag, funcStart, (DWORD)(pushSite - funcStart));
-            LogHex("orig", funcStart, 16);
+            LogHex("orig-16B", funcStart, 16);
             if (PatchBytes(funcStart, STUB, sizeof(STUB))) {
                 Log("[%s]   PATCHED", tag);
                 patched++;
@@ -174,35 +199,62 @@ static bool PatchFuncByString(const char* tag, PBYTE base, DWORD size, const cha
         }
         xrefIdx++;
     }
-    Log("[%s] xrefs=%d patched=%d", tag, xrefIdx, patched);
     return patched > 0;
 }
 
-// ---- Bypass thread -----------------------------------------------------
-static DWORD WINAPI Bypass(LPVOID)
+// ---- Worker: scan + patch (retry until found atau timeout) -------------
+static DWORD WINAPI ScanWorker(LPVOID)
 {
-    Log("bypass thread start");
-    Sleep(150);
+    Log("scan worker start");
+    Sleep(100);
 
     PBYTE base = NULL;
     DWORD size = 0;
     if (!GetMainModuleRange(base, size)) {
         Log("FATAL: GetMainModuleRange failed");
-    } else {
-        Log("lostsaga.exe: base=%p size=%lu (0x%lX)", base, size, size);
+        return 0;
+    }
+    Log("lostsaga.exe: base=%p size=%lu (0x%lX)", base, size, size);
 
-        // Verifikasi bytes pada offset yang ditemukan oleh diagnostic dahulu.
-        // Ini cuma sanity check supaya kita tahu memory readable.
-        PBYTE expected = base + 0x217C105;
-        Log("sanity-check expected GameMon str addr %p:", expected);
-        LogHex("expected-32", expected, 32);
+    bool got_gameMon = false;
+    bool got_exit23  = false;
+    bool got_exit1   = false;
 
-        PatchFuncByString("GameMonErr", base, size, "GameMon Error : %d");
-        PatchFuncByString("ExitProg23", base, size, "ExitProgram - 23");
-        PatchFuncByString("ExitProg1",  base, size, "ExitProgram - 1");
+    // Retry sampai 120 attempts x 250ms = 30 detik max.
+    for (int attempt = 0; attempt < 120; ++attempt) {
+        if (!got_gameMon &&
+            PatchFuncByString("GameMonErr", base, size, "GameMon Error : %d"))
+            got_gameMon = true;
+
+        if (!got_exit23 &&
+            PatchFuncByString("ExitProg23", base, size, "ExitProgram - 23"))
+            got_exit23 = true;
+
+        if (!got_exit1 &&
+            PatchFuncByString("ExitProg1", base, size, "ExitProgram - 1"))
+            got_exit1 = true;
+
+        if (got_gameMon && got_exit23 && got_exit1) {
+            Log("all targets patched at attempt #%d", attempt);
+            break;
+        }
+
+        // Log progress tiap 4 attempts (1 detik) supaya bisa liat polling.
+        if ((attempt % 4) == 0) {
+            Log("attempt #%d: gameMon=%d exit23=%d exit1=%d",
+                attempt, got_gameMon, got_exit23, got_exit1);
+        }
+        Sleep(250);
     }
 
-    Log("entering kill-loop for GameGuard.des");
+    Log("scan worker done. gameMon=%d exit23=%d exit1=%d",
+        got_gameMon, got_exit23, got_exit1);
+    return 0;
+}
+
+// ---- GG kill loop (parallel thread) ------------------------------------
+static DWORD WINAPI GGKillLoop(LPVOID)
+{
     CTools tools;
     int killed = 0;
     while (1) {
@@ -220,7 +272,8 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
     if (reason == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(hModule);
         Log("DllMain DLL_PROCESS_ATTACH (hModule=%p)", hModule);
-        CreateThread(NULL, 0, Bypass, NULL, 0, NULL);
+        CreateThread(NULL, 0, ScanWorker, NULL, 0, NULL);
+        CreateThread(NULL, 0, GGKillLoop, NULL, 0, NULL);
     }
     return TRUE;
 }
