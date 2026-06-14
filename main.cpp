@@ -341,13 +341,60 @@ static bool HookIAT(HMODULE hMod, const char* dllName, const char* funcName, voi
 // Pasang hook untuk fungsi exit yang kemungkinan dipanggil.
 static void InstallExitHooks(HMODULE hMain)
 {
-    // kernel32.dll
-    HookIAT(hMain, "kernel32.dll", "ExitProcess",      (void*)MyExitProcess);
-    HookIAT(hMain, "KERNEL32.dll", "ExitProcess",      (void*)MyExitProcess);
-    HookIAT(hMain, "kernel32.dll", "TerminateProcess", (void*)MyTerminateProcess);
-    HookIAT(hMain, "KERNEL32.dll", "TerminateProcess", (void*)MyTerminateProcess);
-    // ntdll redirect (kadang dipanggil langsung)
-    HookIAT(hMain, "ntdll.dll",    "RtlExitUserProcess", (void*)MyExitProcess);
+    // ---- Cara 1: IAT hook di lostsaga.exe ----
+    bool any = false;
+    if (HookIAT(hMain, "kernel32.dll", "ExitProcess",      (void*)MyExitProcess)) any = true;
+    if (HookIAT(hMain, "KERNEL32.dll", "ExitProcess",      (void*)MyExitProcess)) any = true;
+    if (HookIAT(hMain, "kernel32.dll", "TerminateProcess", (void*)MyTerminateProcess)) any = true;
+    if (HookIAT(hMain, "KERNEL32.dll", "TerminateProcess", (void*)MyTerminateProcess)) any = true;
+    if (HookIAT(hMain, "ntdll.dll",    "RtlExitUserProcess", (void*)MyExitProcess)) any = true;
+    if (!any) {
+        Log("IAT hook: no ExitProcess imports found in lostsaga.exe (game probably uses CRT exit)");
+    }
+
+    // ---- Cara 2: Juga hook IAT di module CRT (msvcr100/71) -------------
+    // CRT's exit() ujungnya call ExitProcess via msvcr*'s own import.
+    HMODULE crt100 = GetModuleHandleA("msvcr100.dll");
+    if (crt100) {
+        if (HookIAT(crt100, "kernel32.dll", "ExitProcess", (void*)MyExitProcess) ||
+            HookIAT(crt100, "KERNEL32.dll", "ExitProcess", (void*)MyExitProcess)) {
+            Log("IAT hook in msvcr100.dll OK");
+        } else {
+            Log("IAT hook in msvcr100.dll: not found");
+        }
+        HookIAT(crt100, "kernel32.dll", "TerminateProcess", (void*)MyTerminateProcess);
+        HookIAT(crt100, "KERNEL32.dll", "TerminateProcess", (void*)MyTerminateProcess);
+    }
+    HMODULE crt71 = GetModuleHandleA("msvcr71.dll");
+    if (crt71) {
+        HookIAT(crt71, "kernel32.dll", "ExitProcess", (void*)MyExitProcess);
+        HookIAT(crt71, "KERNEL32.dll", "ExitProcess", (void*)MyExitProcess);
+    }
+
+    // ---- Cara 3: Patch langsung kernel32!ExitProcess via Copy-On-Write -
+    // Ini catch-all: any caller di proses ini yang panggil ExitProcess
+    // dengan resolusi langsung ke kernel32 (tanpa lewat IAT) tetap di-block.
+    // Patch kena di private copy kernel32 milik proses ini saja.
+    HMODULE k32 = GetModuleHandleA("kernel32.dll");
+    if (k32) {
+        FARPROC pExit = GetProcAddress(k32, "ExitProcess");
+        if (pExit) {
+            // Tulis JMP rel32 ke MyExitProcess di byte ke-0 fungsi ExitProcess.
+            // 5 byte: E9 XX XX XX XX
+            INT32 rel = (INT32)((PBYTE)MyExitProcess - ((PBYTE)pExit + 5));
+            BYTE patch[5] = { 0xE9, 0, 0, 0, 0 };
+            memcpy(patch + 1, &rel, 4);
+            DWORD oldProt = 0, tmp = 0;
+            if (VirtualProtect(pExit, 5, PAGE_EXECUTE_READWRITE, &oldProt)) {
+                memcpy(pExit, patch, 5);
+                VirtualProtect(pExit, 5, oldProt, &tmp);
+                FlushInstructionCache(GetCurrentProcess(), pExit, 5);
+                Log("kernel32!ExitProcess patched (JMP -> %p) at %p", MyExitProcess, pExit);
+            } else {
+                Log("kernel32!ExitProcess patch FAILED: VirtualProtect err=%lu", GetLastError());
+            }
+        }
+    }
 }
 
 // ---- Patch via string xref ---------------------------------------------
