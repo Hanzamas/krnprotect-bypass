@@ -249,9 +249,44 @@ static bool PatchJumpRel32(PBYTE from, PBYTE to)
 typedef VOID (WINAPI *PFN_ExitProcess)(UINT);
 typedef BOOL (WINAPI *PFN_TerminateProcess)(HANDLE, UINT);
 
-// Empty string buffer untuk substitusi NULL pointer dereference.
-// Caller yang panggil string function dengan NULL akan diarahkan ke sini.
-static const char g_emptyStr[64] = {0}; // semua null
+// Empty buffer 16-byte aligned untuk substitusi NULL pointer dereference.
+// Caller yang panggil string/SSE function dengan NULL akan diarahkan ke
+// sini. Ukuran 256 byte supaya SSE 128-bit read pasti aman.
+__declspec(align(16)) static const char g_emptyStr[256] = {0};
+
+// Counter untuk mencegah infinite loop di hatch (jika fix tidak menolong).
+struct HatchCounter { DWORD eip; int count; };
+static HatchCounter g_hatchHistory[16] = {0};
+static CRITICAL_SECTION g_hatchLock;
+static bool g_hatchLockInit = false;
+
+static int HatchCount(DWORD eip)
+{
+    if (!g_hatchLockInit) { InitializeCriticalSection(&g_hatchLock); g_hatchLockInit = true; }
+    EnterCriticalSection(&g_hatchLock);
+    int n = 0;
+    int slot = -1;
+    for (int i = 0; i < 16; ++i) {
+        if (g_hatchHistory[i].eip == eip) {
+            g_hatchHistory[i].count++;
+            n = g_hatchHistory[i].count;
+            slot = i;
+            break;
+        }
+    }
+    if (slot < 0) {
+        for (int i = 0; i < 16; ++i) {
+            if (g_hatchHistory[i].eip == 0) {
+                g_hatchHistory[i].eip = eip;
+                g_hatchHistory[i].count = 1;
+                n = 1;
+                break;
+            }
+        }
+    }
+    LeaveCriticalSection(&g_hatchLock);
+    return n;
+}
 
 // ---- VEH (Vectored Exception Handler) ----------------------------------
 // Log SETIAP exception yang terjadi di lostsaga.exe. Bisa pinpoint alamat
@@ -290,9 +325,10 @@ static LONG WINAPI MyVEH(PEXCEPTION_POINTERS info)
                          rec->ExceptionInformation[0] == 1 ? "WRITE" : "EXEC";
         Log("  AV: %s @ %p", op, (void*)rec->ExceptionInformation[1]);
     }
-    Log("  EIP=%p ESP=%p EBP=%p EAX=%p ECX=%p EDX=%p",
-        (void*)ctx->Eip, (void*)ctx->Esp, (void*)ctx->Ebp,
-        (void*)ctx->Eax, (void*)ctx->Ecx, (void*)ctx->Edx);
+    Log("  EIP=%p ESP=%p EBP=%p", (void*)ctx->Eip, (void*)ctx->Esp, (void*)ctx->Ebp);
+    Log("  EAX=%p ECX=%p EDX=%p EBX=%p",
+        (void*)ctx->Eax, (void*)ctx->Ecx, (void*)ctx->Edx, (void*)ctx->Ebx);
+    Log("  ESI=%p EDI=%p", (void*)ctx->Esi, (void*)ctx->Edi);
 
     // Dump 16 bytes di EIP supaya kita liat instruksi yang crash.
     PBYTE eip = (PBYTE)ctx->Eip;
@@ -304,49 +340,38 @@ static LONG WINAPI MyVEH(PEXCEPTION_POINTERS info)
         Log("  bytes@EIP: <unreadable>");
     }
 
-    // ---- Hatch: NULL deref pada string-loop ----
-    // Pattern paling umum yang kita lihat: `8A 08` (mov cl, [eax]) dengan
-    // EAX = 0. Bisa juga register lain. Untuk setiap pola umum, redirect
-    // register source ke buffer kosong dan resume.
+    // ---- Hatch: NULL deref ----
+    // Strategi: kalau AV READ @ NULL, replace SEMUA register GP yang
+    // bernilai 0 menjadi pointer ke buffer kosong 16-byte aligned.
+    // Instruksi yang gagal akan resume dan baca dari buffer ini (zeros),
+    // sehingga string function / SSE read berjalan tanpa crash.
+    //
+    // Counter mencegah infinite loop bila fix tidak benar-benar
+    // menyelesaikan masalah pada EIP yang sama.
     if (rec->ExceptionCode == EXCEPTION_ACCESS_VIOLATION
         && rec->ExceptionInformation[0] == 0   // READ
         && rec->ExceptionInformation[1] == 0)  // @ NULL
     {
-        DWORD emptyAddr = (DWORD)(DWORD_PTR)g_emptyStr;
-        bool fixed = false;
-        __try {
-            // mov cl/dl/bl/...(8-bit) atau mov reg32, [reg]
-            // 8A 08 = mov cl, [eax]
-            // 8A 0A = mov cl, [edx]
-            // 8A 0E = mov cl, [esi]
-            // 8A 0F = mov cl, [edi]
-            // 8B 08 = mov ecx, [eax]
-            // 8B 1A = mov ebx, [edx]
-            // dll. ModR/M byte: top 2 bits=00 (no displacement),
-            //    middle 3=dest reg, bottom 3=base reg
-            BYTE op = eip[0];
-            BYTE mrm = eip[1];
-            // Hanya handle bila MOD=00 (no displacement, register-indirect).
-            if ((mrm & 0xC0) == 0x00 && (op == 0x8A || op == 0x8B || op == 0x80 || op == 0x81)) {
-                BYTE rmReg = mrm & 0x07; // 0=EAX, 1=ECX, 2=EDX, 3=EBX, 4=ESP, 5=EBP, 6=ESI, 7=EDI
-                DWORD* regs[8] = {
-                    &ctx->Eax, &ctx->Ecx, &ctx->Edx, &ctx->Ebx,
-                    &ctx->Esp, &ctx->Ebp, &ctx->Esi, &ctx->Edi
-                };
-                if (rmReg < 8 && rmReg != 4 && rmReg != 5) {
-                    DWORD oldVal = *regs[rmReg];
-                    if (oldVal == 0) {
-                        *regs[rmReg] = emptyAddr;
-                        Log("  HATCH: register #%d was NULL, redirected to empty string @ %p",
-                            rmReg, (void*)emptyAddr);
-                        fixed = true;
-                    }
+        int n = HatchCount((DWORD)(DWORD_PTR)rec->ExceptionAddress);
+        if (n <= 50) {
+            DWORD emptyAddr = (DWORD)(DWORD_PTR)g_emptyStr;
+            DWORD* gp[8] = {
+                &ctx->Eax, &ctx->Ecx, &ctx->Edx, &ctx->Ebx,
+                &ctx->Esp, &ctx->Ebp, &ctx->Esi, &ctx->Edi
+            };
+            int fixed = 0;
+            for (int i = 0; i < 8; ++i) {
+                if (i == 4) continue; // jangan sentuh ESP, akan rusak frame
+                if (*gp[i] == 0) {
+                    *gp[i] = emptyAddr;
+                    fixed++;
                 }
             }
-        } __except (EXCEPTION_EXECUTE_HANDLER) {}
-
-        if (fixed) {
+            Log("  HATCH: redirected %d NULL registers to empty buffer @ %p (try #%d at this EIP)",
+                fixed, (void*)emptyAddr, n);
             return EXCEPTION_CONTINUE_EXECUTION;
+        } else {
+            Log("  HATCH: gave up after 50 tries at this EIP, forwarding to default handler");
         }
     }
 
