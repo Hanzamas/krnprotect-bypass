@@ -1,21 +1,19 @@
 #include <windows.h>
+#include <psapi.h>
 #include <string.h>
 #include <stdio.h>
 #include "lib/CTools.h"
 
+#pragma comment(lib, "psapi.lib")
+
 // =====================================================================
 // Proxy DLL untuk Lost Saga.
-// Drop file ini sebagai `xinput1_3.dll` di folder game; rename DLL asli
-// menjadi `xinput1_3_org.dll`. Semua fungsi XInput di-forward ke DLL
-// asli sehingga gamepad tetap berfungsi.
+// Drop sebagai `xinput1_3.dll`; rename DLL asli jadi `xinput1_3_org.dll`.
 //
-// DllMain men-spawn thread bypass yang:
-//   1. Mencari & mem-patch fungsi nProtect/exit di lostsaga.exe via
-//      AOB (Array Of Bytes) string scan -- tidak butuh offset hardcoded.
-//   2. Terus-menerus terminate process GameGuard.des supaya GG tidak
-//      berhasil melakukan validasi.
-//
-// LOG: ditulis ke `bypass.log` di folder game (working directory).
+// MODE DIAGNOSTIK: enumerate semua loaded module, scan pola kandidat
+// string nProtect/GameGuard/Exit, log hasilnya ke `bypass.log`.
+// Tujuannya cari MODULE mana yg berisi string target supaya bisa
+// di-target untuk patch.
 // =====================================================================
 
 #pragma comment(linker, "/export:XInputGetState=xinput1_3_org.XInputGetState,@2")
@@ -27,7 +25,7 @@
 #pragma comment(linker, "/export:XInputGetKeystroke=xinput1_3_org.XInputGetKeystroke,@8")
 #pragma comment(linker, "/export:XInputGetStateEx=xinput1_3_org.XInputGetStateEx,@100")
 
-// ---- Logger sederhana (write to file) ----------------------------------
+// ---- Logger ------------------------------------------------------------
 static CRITICAL_SECTION g_logLock;
 static bool g_logInit = false;
 
@@ -36,12 +34,8 @@ static void LogInit()
     if (!g_logInit) {
         InitializeCriticalSection(&g_logLock);
         g_logInit = true;
-        // truncate log on first init
         FILE* f = fopen("bypass.log", "w");
-        if (f) {
-            fprintf(f, "=== bypass.log started ===\n");
-            fclose(f);
-        }
+        if (f) { fprintf(f, "=== bypass.log (diagnostic mode) ===\n"); fclose(f); }
     }
 }
 
@@ -51,12 +45,9 @@ static void Log(const char* fmt, ...)
     EnterCriticalSection(&g_logLock);
     FILE* f = fopen("bypass.log", "a");
     if (f) {
-        SYSTEMTIME st;
-        GetLocalTime(&st);
-        fprintf(f, "[%02d:%02d:%02d.%03d] ",
-                st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
-        va_list args;
-        va_start(args, fmt);
+        SYSTEMTIME st; GetLocalTime(&st);
+        fprintf(f, "[%02d:%02d:%02d.%03d] ", st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
+        va_list args; va_start(args, fmt);
         vfprintf(f, fmt, args);
         va_end(args);
         fprintf(f, "\n");
@@ -65,21 +56,7 @@ static void Log(const char* fmt, ...)
     LeaveCriticalSection(&g_logLock);
 }
 
-// ---- Helper: ambil rentang module utama (lostsaga.exe) ------------------
-static bool GetMainModuleRange(PBYTE& base, DWORD& size)
-{
-    HMODULE mod = GetModuleHandleA(NULL);
-    if (!mod) return false;
-    PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)mod;
-    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return false;
-    PIMAGE_NT_HEADERS nt = (PIMAGE_NT_HEADERS)((PBYTE)mod + dos->e_lfanew);
-    if (nt->Signature != IMAGE_NT_SIGNATURE) return false;
-    base = (PBYTE)mod;
-    size = nt->OptionalHeader.SizeOfImage;
-    return true;
-}
-
-// ---- Helper: cari pola byte di rentang memori ---------------------------
+// ---- Pattern scan ------------------------------------------------------
 static PBYTE FindBytes(PBYTE base, DWORD size, const BYTE* pattern, DWORD patSize)
 {
     if (size < patSize) return NULL;
@@ -91,128 +68,147 @@ static PBYTE FindBytes(PBYTE base, DWORD size, const BYTE* pattern, DWORD patSiz
     return NULL;
 }
 
-// ---- Helper: cari instruksi `push imm32` (0x68 XX XX XX XX) -------------
-static PBYTE FindPushImm32(PBYTE base, DWORD size, DWORD imm)
+// ---- Hexdump kecil untuk verifikasi pattern hit -------------------------
+static void LogHexAround(PBYTE addr, int beforeLen, int afterLen)
 {
-    if (size < 5) return NULL;
-    DWORD last = size - 5;
-    for (DWORD i = 0; i <= last; ++i) {
-        if (base[i] == 0x68 && *(DWORD*)(base + i + 1) == imm)
-            return base + i;
+    char buf[256] = {0};
+    int pos = 0;
+    PBYTE start = addr - beforeLen;
+    int total = beforeLen + afterLen;
+    for (int i = 0; i < total && pos < (int)sizeof(buf) - 4; ++i) {
+        pos += sprintf(buf + pos, "%02X ", start[i]);
     }
-    return NULL;
+    Log("    bytes: %s", buf);
 }
 
-// ---- Helper: jalan mundur cari prologue fungsi (55 8B EC) --------------
-static PBYTE FindFuncStartBack(PBYTE addr, DWORD maxBack)
-{
-    for (DWORD i = 0; i < maxBack; ++i) {
-        PBYTE p = addr - i;
-        if (p[0] == 0x55 && p[1] == 0x8B && p[2] == 0xEC)
-            return p;
-    }
-    return NULL;
-}
-
-// ---- Helper: patch byte dengan handle proteksi memory -------------------
-static bool PatchBytes(PBYTE addr, const BYTE* bytes, DWORD len)
-{
-    DWORD oldProt = 0, tmp = 0;
-    if (!VirtualProtect(addr, len, PAGE_EXECUTE_READWRITE, &oldProt)) {
-        Log("  PatchBytes: VirtualProtect failed at %p, err=%lu", addr, GetLastError());
-        return false;
-    }
-    memcpy(addr, bytes, len);
-    VirtualProtect(addr, len, oldProt, &tmp);
-    FlushInstructionCache(GetCurrentProcess(), addr, len);
-    return true;
-}
-
-// ---- Bypass via string xref --------------------------------------------
-static bool BypassByStringXref(const char* name, PBYTE base, DWORD size,
-                               const BYTE* strBytes, DWORD strLen)
-{
-    Log("[%s] scanning string (%lu bytes)...", name, strLen);
-    PBYTE strAddr = FindBytes(base, size, strBytes, strLen);
-    if (!strAddr) {
-        Log("[%s] string NOT FOUND", name);
-        return false;
-    }
-    Log("[%s] string at %p", name, strAddr);
-
-    PBYTE pushSite = FindPushImm32(base, size, (DWORD)(DWORD_PTR)strAddr);
-    if (!pushSite) {
-        Log("[%s] no `push imm32` xref to string", name);
-        return false;
-    }
-    Log("[%s] push xref at %p", name, pushSite);
-
-    PBYTE funcStart = FindFuncStartBack(pushSite, 0x800);
-    if (!funcStart) {
-        Log("[%s] no prologue 55 8B EC within 2KB", name);
-        return false;
-    }
-    Log("[%s] func prologue at %p (offset -%lu from xref)",
-        name, funcStart, (DWORD)(pushSite - funcStart));
-
-    // Log original first 8 bytes of function for forensic.
-    Log("[%s] orig: %02X %02X %02X %02X %02X %02X %02X %02X",
-        name, funcStart[0], funcStart[1], funcStart[2], funcStart[3],
-              funcStart[4], funcStart[5], funcStart[6], funcStart[7]);
-
-    static const BYTE STUB[] = { 0x31, 0xC0, 0xC3 }; // xor eax,eax; ret
-    bool ok = PatchBytes(funcStart, STUB, sizeof(STUB));
-    Log("[%s] patch %s", name, ok ? "OK" : "FAILED");
-    return ok;
-}
-
-// "nProtect Error : %s:%s\n\0"
-static const BYTE STR_NPROT_ERR[] = {
-    0x6E,0x50,0x72,0x6F,0x74,0x65,0x63,0x74,0x20,
-    0x45,0x72,0x72,0x6F,0x72,0x20,0x3A,0x20,
-    0x25,0x73,0x3A,0x25,0x73,0x0A,0x00
+// ---- Daftar string kandidat untuk discovery -----------------------------
+struct CandidateStr {
+    const char* label;
+    const BYTE* bytes;
+    DWORD       len;
+    bool        printable; // dump preview
 };
 
-// "ExitProgram - 23\0"
-static const BYTE STR_EXITPROG23[] = {
-    0x45,0x78,0x69,0x74,0x50,0x72,0x6F,0x67,0x72,0x61,0x6D,0x20,0x2D,0x20,0x32,0x33,0x00
+// Variasi panjang/pendek dari nProtect & GameGuard error messages
+static const BYTE S_NPROTECT[]    = { 'n','P','r','o','t','e','c','t' };
+static const BYTE S_NPROT_ERR[]   = { 'n','P','r','o','t','e','c','t',' ','E','r','r','o','r' };
+static const BYTE S_NPROT_FULL[]  = { 'n','P','r','o','t','e','c','t',' ','E','r','r','o','r',' ',':',' ','%','s',':','%','s','\n','\0' };
+static const BYTE S_NPROT_OLD[]   = { 'n','P','r','o','t','e','c','t',' ','E','r','r','o','r',' ',':',' ','%','s',' ',':',' ','%','s','\n','\0' };
+static const BYTE S_INITCMP[]     = { 'I','n','i','t',' ','C','o','m','p','l','e','t','e' };
+static const BYTE S_GAMEGUARD[]   = { 'G','a','m','e','G','u','a','r','d' };
+static const BYTE S_GAMEGUARDDES[]= { 'G','a','m','e','G','u','a','r','d','.','d','e','s' };
+static const BYTE S_GAMEMON[]     = { 'G','a','m','e','M','o','n' };
+static const BYTE S_EXITPROG[]    = { 'E','x','i','t','P','r','o','g','r','a','m' };
+static const BYTE S_EXITPROG23[]  = { 'E','x','i','t','P','r','o','g','r','a','m',' ','-',' ','2','3' };
+static const BYTE S_NPROT_INIT[]  = { 'n','P','r','o','t','e','c','t',' ','I','n','i','t' };
+static const BYTE S_NPGGNT[]      = { 'n','p','g','g','N','T' };
+static const BYTE S_NPKCRYPT[]    = { 'n','p','k','c','r','y','p','t' };
+static const BYTE S_INCAINTER[]   = { 'I','N','C','A',' ','I','n','t','e','r','n','e','t' };
+
+static const CandidateStr CANDIDATES[] = {
+    {"nProtect",       S_NPROTECT,     sizeof(S_NPROTECT),     true},
+    {"nProtect Error", S_NPROT_ERR,    sizeof(S_NPROT_ERR),    true},
+    {"nProtect Err+%s",S_NPROT_FULL,   sizeof(S_NPROT_FULL),   false},
+    {"nProtect old",   S_NPROT_OLD,    sizeof(S_NPROT_OLD),    false},
+    {"nProtect Init",  S_NPROT_INIT,   sizeof(S_NPROT_INIT),   true},
+    {"Init Complete",  S_INITCMP,      sizeof(S_INITCMP),      true},
+    {"GameGuard",      S_GAMEGUARD,    sizeof(S_GAMEGUARD),    true},
+    {"GameGuard.des",  S_GAMEGUARDDES, sizeof(S_GAMEGUARDDES), true},
+    {"GameMon",        S_GAMEMON,      sizeof(S_GAMEMON),      true},
+    {"ExitProgram",    S_EXITPROG,     sizeof(S_EXITPROG),     true},
+    {"ExitProgram -23",S_EXITPROG23,   sizeof(S_EXITPROG23),   true},
+    {"npggNT",         S_NPGGNT,       sizeof(S_NPGGNT),       true},
+    {"npkcrypt",       S_NPKCRYPT,     sizeof(S_NPKCRYPT),     true},
+    {"INCA Internet",  S_INCAINTER,    sizeof(S_INCAINTER),    true},
 };
 
-static DWORD WINAPI NProtectBypass(LPVOID)
+// ---- Scan satu module untuk semua kandidat string -----------------------
+static void ScanModule(const char* moduleName, PBYTE base, DWORD size)
 {
-    Log("bypass thread start");
+    int nCandidates = sizeof(CANDIDATES) / sizeof(CANDIDATES[0]);
+    int hits = 0;
+    for (int i = 0; i < nCandidates; ++i) {
+        PBYTE p = FindBytes(base, size, CANDIDATES[i].bytes, CANDIDATES[i].len);
+        if (p) {
+            Log("  [HIT] %-18s @ %p  (offset 0x%lX)",
+                CANDIDATES[i].label, p, (DWORD)(p - base));
+            if (CANDIDATES[i].printable) {
+                LogHexAround(p, 0, 32);
+            }
+            hits++;
+        }
+    }
+    if (hits == 0) {
+        Log("  (no candidate strings found in %s)", moduleName);
+    }
+}
 
+// ---- Diagnostic thread -------------------------------------------------
+static DWORD WINAPI Diagnostic(LPVOID)
+{
+    Log("diagnostic thread start");
+
+    // Beri waktu image utama dan import-nya untuk fully map.
+    Sleep(200);
+
+    HMODULE modules[256];
+    DWORD needed = 0;
+    HANDLE hProc = GetCurrentProcess();
+    if (!EnumProcessModules(hProc, modules, sizeof(modules), &needed)) {
+        Log("EnumProcessModules failed: %lu", GetLastError());
+        return 0;
+    }
+    DWORD nMod = needed / sizeof(HMODULE);
+    Log("enumerated %lu loaded modules", nMod);
+
+    for (DWORD i = 0; i < nMod; ++i) {
+        char modName[MAX_PATH] = {0};
+        char modPath[MAX_PATH] = {0};
+        GetModuleBaseNameA(hProc, modules[i], modName, sizeof(modName));
+        GetModuleFileNameExA(hProc, modules[i], modPath, sizeof(modPath));
+
+        MODULEINFO mi = {0};
+        if (!GetModuleInformation(hProc, modules[i], &mi, sizeof(mi)))
+            continue;
+
+        // Filter: skip system DLLs (windows, system32) -- noise.
+        bool isSystem =
+            strstr(modPath, "\\Windows\\")  ||
+            strstr(modPath, "\\windows\\")  ||
+            strstr(modPath, "\\WINDOWS\\");
+        if (isSystem) continue;
+
+        Log("--- module: %s  base=%p  size=%lu (0x%lX) ---",
+            modName, mi.lpBaseOfDll, mi.SizeOfImage, mi.SizeOfImage);
+        ScanModule(modName, (PBYTE)mi.lpBaseOfDll, mi.SizeOfImage);
+    }
+
+    Log("diagnostic done");
+    return 0;
+}
+
+// ---- GG kill loop ------------------------------------------------------
+static DWORD WINAPI GGKillLoop(LPVOID)
+{
     CTools tools;
-    Sleep(50); // give image a moment to fully map
-
-    PBYTE base = NULL;
-    DWORD size = 0;
-    if (!GetMainModuleRange(base, size)) {
-        Log("FATAL: GetMainModuleRange failed");
-    } else {
-        Log("main module: base=%p size=%lu (0x%lX)", base, size, size);
-        BypassByStringXref("nProtect", base, size, STR_NPROT_ERR, sizeof(STR_NPROT_ERR));
-        BypassByStringXref("ExitProg23", base, size, STR_EXITPROG23, sizeof(STR_EXITPROG23));
-    }
-
-    Log("entering kill-loop for GameGuard.des");
     int killed = 0;
     while (1) {
         if (tools.TerminateProcessByName("GameGuard.des")) {
             killed++;
-            if (killed <= 5 || (killed % 50) == 0)
+            if (killed <= 5 || (killed % 100) == 0)
                 Log("killed GameGuard.des (count=%d)", killed);
         }
         Sleep(20);
     }
 }
 
-BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID /*reserved*/)
+BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
 {
     if (reason == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(hModule);
         Log("DllMain DLL_PROCESS_ATTACH (hModule=%p)", hModule);
-        CreateThread(NULL, 0, NProtectBypass, NULL, 0, NULL);
+        CreateThread(NULL, 0, Diagnostic, NULL, 0, NULL);
+        CreateThread(NULL, 0, GGKillLoop,  NULL, 0, NULL);
     }
     return TRUE;
 }
