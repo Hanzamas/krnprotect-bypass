@@ -8,17 +8,14 @@
 // Drop sebagai `xinput1_3.dll`; rename DLL asli jadi `xinput1_3_org.dll`.
 //
 // lostsaga.exe ter-pack: strings (incl. error message GG) baru ada
-// SETELAH unpacker decrypt section .rdata. Dimana DllMain dipanggil di
-// titik awal, kita harus retry scan sampai strings muncul.
+// SETELAH unpacker decrypt section .rdata. Jadi kita retry scan sampai
+// strings muncul.
 //
 // Strategi:
-//   - Background loop scan tiap 200ms
-//   - Untuk setiap string target: cari -> xref -> walk back ke prologue
-//     -> patch dengan `xor eax,eax; ret`
-//   - Stop setelah semua target ke-patch atau timeout
+//   - Worker: scan + patch tiap 200ms, retry sampai semua patch atau timeout
+//   - SEH wrapper untuk handle bila page belum committed
+//   - Walk per region (VirtualQuery per region, bukan per byte) supaya cepat
 //   - Paralel: kill loop GameGuard.des
-//
-// Log: `bypass.log` di folder game.
 // =====================================================================
 
 #pragma comment(linker, "/export:XInputGetState=xinput1_3_org.XInputGetState,@2")
@@ -85,39 +82,54 @@ static bool GetMainModuleRange(PBYTE& base, DWORD& size)
     return true;
 }
 
-// ---- Pattern utilities -------------------------------------------------
-// Safe-read: pakai SEH/IsBadReadPtr-style guard via VirtualQuery, supaya
-// scan tidak crash bila beberapa page belum committed.
-static bool IsReadable(PBYTE p, DWORD n)
+// ---- SEH-safe memcmp ---------------------------------------------------
+static int SafeMemcmp(const void* a, const void* b, size_t n)
 {
-    MEMORY_BASIC_INFORMATION mbi;
-    if (!VirtualQuery(p, &mbi, sizeof(mbi))) return false;
-    if (mbi.State != MEM_COMMIT) return false;
-    if (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) return false;
-    PBYTE regionEnd = (PBYTE)mbi.BaseAddress + mbi.RegionSize;
-    return (p + n) <= regionEnd;
+    __try {
+        return memcmp(a, b, n);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        return 1; // tidak match -> lanjut iterasi
+    }
 }
 
-static PBYTE FindBytes(PBYTE base, DWORD size, const BYTE* pattern, DWORD patSize)
+// ---- Pattern utilities (region-aware, fast) ----------------------------
+// Walk per region (VirtualQuery per region) supaya tidak panggil syscall
+// 48 juta kali. Skip region yang non-committed/no-access.
+static PBYTE FindBytesRegion(PBYTE rangeStart, DWORD rangeSize,
+                             const BYTE* pattern, DWORD patSize)
 {
-    if (size < patSize) return NULL;
-    DWORD last = size - patSize;
+    if (rangeSize < patSize) return NULL;
+    PBYTE rangeEnd = rangeStart + rangeSize;
+    PBYTE p = rangeStart;
 
-    // Scan halaman demi halaman (4KB), skip yang non-committed.
-    const DWORD PAGE = 0x1000;
-    for (DWORD i = 0; i <= last; ) {
-        // Cek apakah pattern bisa muat di sini (cross-page check).
-        if (!IsReadable(base + i, patSize)) {
-            // Skip ke awal halaman berikutnya.
-            DWORD nextPage = ((DWORD)(DWORD_PTR)(base + i) & ~(PAGE - 1)) + PAGE
-                             - (DWORD)(DWORD_PTR)base;
-            if (nextPage <= i) i++;
-            else i = nextPage;
+    while (p + patSize <= rangeEnd) {
+        MEMORY_BASIC_INFORMATION mbi;
+        if (!VirtualQuery(p, &mbi, sizeof(mbi))) {
+            p += 0x1000;
             continue;
         }
-        if (memcmp(base + i, pattern, patSize) == 0)
-            return base + i;
-        i++;
+        PBYTE regionEnd = (PBYTE)mbi.BaseAddress + mbi.RegionSize;
+        if (regionEnd > rangeEnd) regionEnd = rangeEnd;
+
+        bool readable = (mbi.State == MEM_COMMIT) &&
+                        ((mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) == 0);
+        if (!readable) {
+            p = regionEnd;
+            continue;
+        }
+
+        // Scan dalam region. Pattern dapat melewati boundary region jika
+        // berdekatan; untuk simpel kita batasi tidak melewati regionEnd.
+        DWORD scanCount = (DWORD)(regionEnd - p);
+        if (scanCount >= patSize) {
+            DWORD lim = scanCount - patSize + 1;
+            for (DWORD i = 0; i < lim; ++i) {
+                if (SafeMemcmp(p + i, pattern, patSize) == 0)
+                    return p + i;
+            }
+        }
+        p = regionEnd;
     }
     return NULL;
 }
@@ -125,21 +137,50 @@ static PBYTE FindBytes(PBYTE base, DWORD size, const BYTE* pattern, DWORD patSiz
 static PBYTE FindStrZ(PBYTE base, DWORD size, const char* str)
 {
     DWORD len = (DWORD)strlen(str) + 1;
-    return FindBytes(base, size, (const BYTE*)str, len);
+    return FindBytesRegion(base, size, (const BYTE*)str, len);
 }
 
-// `push imm32` (0x68 + 4-byte). Kembalikan occurrence ke-`nth`.
-static PBYTE FindPushImm32_N(PBYTE base, DWORD size, DWORD imm, int nth)
+// `push imm32` (0x68 + 4-byte). Kembalikan occurrence ke-`nth` (region-aware).
+static PBYTE FindPushImm32_N(PBYTE rangeStart, DWORD rangeSize, DWORD imm, int nth)
 {
-    if (size < 5) return NULL;
-    DWORD last = size - 5;
+    PBYTE rangeEnd = rangeStart + rangeSize;
+    PBYTE p = rangeStart;
     int seen = 0;
-    for (DWORD i = 0; i <= last; ++i) {
-        if (!IsReadable(base + i, 5)) { i += 0x1000; continue; }
-        if (base[i] == 0x68 && *(DWORD*)(base + i + 1) == imm) {
-            if (seen == nth) return base + i;
-            seen++;
+
+    while (p + 5 <= rangeEnd) {
+        MEMORY_BASIC_INFORMATION mbi;
+        if (!VirtualQuery(p, &mbi, sizeof(mbi))) {
+            p += 0x1000;
+            continue;
         }
+        PBYTE regionEnd = (PBYTE)mbi.BaseAddress + mbi.RegionSize;
+        if (regionEnd > rangeEnd) regionEnd = rangeEnd;
+
+        bool readable = (mbi.State == MEM_COMMIT) &&
+                        ((mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) == 0);
+        bool executable = (mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ |
+                                          PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) != 0;
+        if (!readable || !executable) {
+            p = regionEnd;
+            continue;
+        }
+
+        DWORD scanCount = (DWORD)(regionEnd - p);
+        if (scanCount >= 5) {
+            DWORD lim = scanCount - 5 + 1;
+            for (DWORD i = 0; i < lim; ++i) {
+                __try {
+                    if (p[i] == 0x68 && *(DWORD*)(p + i + 1) == imm) {
+                        if (seen == nth) return p + i;
+                        seen++;
+                    }
+                }
+                __except (EXCEPTION_EXECUTE_HANDLER) {
+                    break; // region rusak, pindah
+                }
+            }
+        }
+        p = regionEnd;
     }
     return NULL;
 }
@@ -148,9 +189,13 @@ static PBYTE FindFuncStartBack(PBYTE addr, DWORD maxBack)
 {
     for (DWORD i = 0; i < maxBack; ++i) {
         PBYTE p = addr - i;
-        if (!IsReadable(p, 3)) continue;
-        if (p[0] == 0x55 && p[1] == 0x8B && p[2] == 0xEC)
-            return p;
+        __try {
+            if (p[0] == 0x55 && p[1] == 0x8B && p[2] == 0xEC)
+                return p;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {
+            return NULL;
+        }
     }
     return NULL;
 }
@@ -202,7 +247,7 @@ static bool PatchFuncByString(const char* tag, PBYTE base, DWORD size, const cha
     return patched > 0;
 }
 
-// ---- Worker: scan + patch (retry until found atau timeout) -------------
+// ---- Worker: scan + patch (retry sampai found atau timeout) ------------
 static DWORD WINAPI ScanWorker(LPVOID)
 {
     Log("scan worker start");
@@ -220,8 +265,8 @@ static DWORD WINAPI ScanWorker(LPVOID)
     bool got_exit23  = false;
     bool got_exit1   = false;
 
-    // Retry sampai 120 attempts x 250ms = 30 detik max.
-    for (int attempt = 0; attempt < 120; ++attempt) {
+    // Retry sampai 240 attempts x 250ms = 60 detik max.
+    for (int attempt = 0; attempt < 240; ++attempt) {
         if (!got_gameMon &&
             PatchFuncByString("GameMonErr", base, size, "GameMon Error : %d"))
             got_gameMon = true;
@@ -235,12 +280,11 @@ static DWORD WINAPI ScanWorker(LPVOID)
             got_exit1 = true;
 
         if (got_gameMon && got_exit23 && got_exit1) {
-            Log("all targets patched at attempt #%d", attempt);
+            Log("ALL targets patched at attempt #%d", attempt);
             break;
         }
 
-        // Log progress tiap 4 attempts (1 detik) supaya bisa liat polling.
-        if ((attempt % 4) == 0) {
+        if ((attempt % 8) == 0) {
             Log("attempt #%d: gameMon=%d exit23=%d exit1=%d",
                 attempt, got_gameMon, got_exit23, got_exit1);
         }
