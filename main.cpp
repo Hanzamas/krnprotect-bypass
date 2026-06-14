@@ -7,15 +7,14 @@
 // Proxy DLL untuk Lost Saga (build 12861).
 // Drop sebagai `xinput1_3.dll`; rename DLL asli jadi `xinput1_3_org.dll`.
 //
-// lostsaga.exe ter-pack: strings (incl. error message GG) baru ada
-// SETELAH unpacker decrypt section .rdata. Jadi kita retry scan sampai
-// strings muncul.
-//
+// lostsaga.exe ter-pack: strings baru muncul setelah unpacker decrypt.
 // Strategi:
-//   - Worker: scan + patch tiap 200ms, retry sampai semua patch atau timeout
-//   - SEH wrapper untuk handle bila page belum committed
-//   - Walk per region (VirtualQuery per region, bukan per byte) supaya cepat
-//   - Paralel: kill loop GameGuard.des
+//   - Worker: scan + patch tiap 250ms, retry sampai semua patch atau timeout
+//   - Cari xref via `push imm32` (0x68) DAN `mov reg, imm32` (B8-BF)
+//   - Untuk fungsi target: patch dengan JMP rel32 ke epilogue fungsi
+//     sendiri (`5D C3` atau `5D C2 NN NN`) supaya stack restored benar.
+//   - Patch banyak exit reasons: ExitProgram - 1 sampai 30.
+//   - Plus: kill loop GameGuard.des
 // =====================================================================
 
 #pragma comment(linker, "/export:XInputGetState=xinput1_3_org.XInputGetState,@2")
@@ -68,6 +67,27 @@ static void LogHex(const char* tag, const void* data, int n)
     Log("  %s: %s", tag, buf);
 }
 
+// Dump ASCII strings (>=4 chars) di rentang.
+static void DumpStringsIn(PBYTE start, DWORD len)
+{
+    DWORD i = 0;
+    while (i < len) {
+        // mulai string?
+        if (start[i] >= 0x20 && start[i] < 0x7F) {
+            DWORD begin = i;
+            while (i < len && start[i] >= 0x20 && start[i] < 0x7F) i++;
+            DWORD slen = i - begin;
+            if (slen >= 4) {
+                char buf[128] = {0};
+                DWORD copy = slen < sizeof(buf) - 1 ? slen : sizeof(buf) - 1;
+                memcpy(buf, start + begin, copy);
+                Log("  str@+%lu (%lu): %s", begin, slen, buf);
+            }
+        }
+        i++;
+    }
+}
+
 // ---- Module helpers ----------------------------------------------------
 static bool GetMainModuleRange(PBYTE& base, DWORD& size)
 {
@@ -82,45 +102,36 @@ static bool GetMainModuleRange(PBYTE& base, DWORD& size)
     return true;
 }
 
-// ---- SEH-safe memcmp ---------------------------------------------------
+// ---- SEH-safe helpers --------------------------------------------------
 static int SafeMemcmp(const void* a, const void* b, size_t n)
 {
-    __try {
-        return memcmp(a, b, n);
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER) {
-        return 1; // tidak match -> lanjut iterasi
-    }
+    __try { return memcmp(a, b, n); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 1; }
 }
 
-// ---- Pattern utilities (region-aware, fast) ----------------------------
-// Walk per region (VirtualQuery per region) supaya tidak panggil syscall
-// 48 juta kali. Skip region yang non-committed/no-access.
+// Walk per region. Skip non-committed/no-access. Optional: only executable.
 static PBYTE FindBytesRegion(PBYTE rangeStart, DWORD rangeSize,
-                             const BYTE* pattern, DWORD patSize)
+                             const BYTE* pattern, DWORD patSize,
+                             bool execOnly)
 {
     if (rangeSize < patSize) return NULL;
     PBYTE rangeEnd = rangeStart + rangeSize;
     PBYTE p = rangeStart;
-
     while (p + patSize <= rangeEnd) {
         MEMORY_BASIC_INFORMATION mbi;
-        if (!VirtualQuery(p, &mbi, sizeof(mbi))) {
-            p += 0x1000;
-            continue;
-        }
+        if (!VirtualQuery(p, &mbi, sizeof(mbi))) { p += 0x1000; continue; }
         PBYTE regionEnd = (PBYTE)mbi.BaseAddress + mbi.RegionSize;
         if (regionEnd > rangeEnd) regionEnd = rangeEnd;
 
         bool readable = (mbi.State == MEM_COMMIT) &&
                         ((mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) == 0);
-        if (!readable) {
+        bool executable = (mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ |
+                                          PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) != 0;
+        if (!readable || (execOnly && !executable)) {
             p = regionEnd;
             continue;
         }
 
-        // Scan dalam region. Pattern dapat melewati boundary region jika
-        // berdekatan; untuk simpel kita batasi tidak melewati regionEnd.
         DWORD scanCount = (DWORD)(regionEnd - p);
         if (scanCount >= patSize) {
             DWORD lim = scanCount - patSize + 1;
@@ -137,22 +148,20 @@ static PBYTE FindBytesRegion(PBYTE rangeStart, DWORD rangeSize,
 static PBYTE FindStrZ(PBYTE base, DWORD size, const char* str)
 {
     DWORD len = (DWORD)strlen(str) + 1;
-    return FindBytesRegion(base, size, (const BYTE*)str, len);
+    return FindBytesRegion(base, size, (const BYTE*)str, len, false);
 }
 
-// `push imm32` (0x68 + 4-byte). Kembalikan occurrence ke-`nth` (region-aware).
-static PBYTE FindPushImm32_N(PBYTE rangeStart, DWORD rangeSize, DWORD imm, int nth)
+// Cari xref code: `push imm32` (0x68 + 4-byte) ATAU `mov reg, imm32` (B8-BF + 4-byte).
+// Kembalikan posisi instruksi (untuk push) atau awal mov (untuk mov+push).
+static PBYTE FindCodeXref_N(PBYTE base, DWORD size, DWORD imm, int nth)
 {
-    PBYTE rangeEnd = rangeStart + rangeSize;
-    PBYTE p = rangeStart;
+    PBYTE rangeEnd = base + size;
+    PBYTE p = base;
     int seen = 0;
 
     while (p + 5 <= rangeEnd) {
         MEMORY_BASIC_INFORMATION mbi;
-        if (!VirtualQuery(p, &mbi, sizeof(mbi))) {
-            p += 0x1000;
-            continue;
-        }
+        if (!VirtualQuery(p, &mbi, sizeof(mbi))) { p += 0x1000; continue; }
         PBYTE regionEnd = (PBYTE)mbi.BaseAddress + mbi.RegionSize;
         if (regionEnd > rangeEnd) regionEnd = rangeEnd;
 
@@ -160,24 +169,25 @@ static PBYTE FindPushImm32_N(PBYTE rangeStart, DWORD rangeSize, DWORD imm, int n
                         ((mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) == 0);
         bool executable = (mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ |
                                           PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) != 0;
-        if (!readable || !executable) {
-            p = regionEnd;
-            continue;
-        }
+        if (!readable || !executable) { p = regionEnd; continue; }
 
         DWORD scanCount = (DWORD)(regionEnd - p);
         if (scanCount >= 5) {
             DWORD lim = scanCount - 5 + 1;
             for (DWORD i = 0; i < lim; ++i) {
                 __try {
-                    if (p[i] == 0x68 && *(DWORD*)(p + i + 1) == imm) {
+                    BYTE op = p[i];
+                    bool match = false;
+                    // push imm32
+                    if (op == 0x68) match = true;
+                    // mov eax/ecx/edx/ebx/esp/ebp/esi/edi, imm32
+                    else if (op >= 0xB8 && op <= 0xBF) match = true;
+                    if (match && *(DWORD*)(p + i + 1) == imm) {
                         if (seen == nth) return p + i;
                         seen++;
                     }
                 }
-                __except (EXCEPTION_EXECUTE_HANDLER) {
-                    break; // region rusak, pindah
-                }
+                __except (EXCEPTION_EXECUTE_HANDLER) { break; }
             }
         }
         p = regionEnd;
@@ -193,9 +203,21 @@ static PBYTE FindFuncStartBack(PBYTE addr, DWORD maxBack)
             if (p[0] == 0x55 && p[1] == 0x8B && p[2] == 0xEC)
                 return p;
         }
-        __except (EXCEPTION_EXECUTE_HANDLER) {
-            return NULL;
+        __except (EXCEPTION_EXECUTE_HANDLER) { return NULL; }
+    }
+    return NULL;
+}
+
+// Scan forward cari epilogue `5D C3` (pop ebp; ret) atau `5D C2 NN NN` (ret imm16).
+static PBYTE FindFunctionEpilogue(PBYTE start, DWORD maxScan)
+{
+    for (DWORD i = 0; i < maxScan; ++i) {
+        PBYTE p = start + i;
+        __try {
+            if (p[0] == 0x5D && (p[1] == 0xC3 || p[1] == 0xC2))
+                return p;
         }
+        __except (EXCEPTION_EXECUTE_HANDLER) { return NULL; }
     }
     return NULL;
 }
@@ -213,25 +235,6 @@ static bool PatchBytes(PBYTE addr, const BYTE* bytes, DWORD len)
     return true;
 }
 
-// Scan forward dari `start` cari epilogue `5D C3` (pop ebp; ret) atau
-// `5D C2 NN NN` (pop ebp; ret imm16). Itu ujung natural fungsi -- stack
-// di-restore dengan benar tanpa kita perlu tahu calling convention.
-static PBYTE FindFunctionEpilogue(PBYTE start, DWORD maxScan)
-{
-    for (DWORD i = 0; i < maxScan; ++i) {
-        PBYTE p = start + i;
-        __try {
-            if (p[0] == 0x5D && (p[1] == 0xC3 || p[1] == 0xC2))
-                return p;
-        }
-        __except (EXCEPTION_EXECUTE_HANDLER) {
-            return NULL;
-        }
-    }
-    return NULL;
-}
-
-// Tulis JMP rel32 dari `from` ke `to` (5 byte: E9 + 4-byte offset).
 static bool PatchJumpRel32(PBYTE from, PBYTE to)
 {
     INT32 rel = (INT32)((PBYTE)to - (from + 5));
@@ -241,44 +244,44 @@ static bool PatchJumpRel32(PBYTE from, PBYTE to)
 }
 
 // ---- Patch via string xref ---------------------------------------------
-static bool PatchFuncByString(const char* tag, PBYTE base, DWORD size, const char* str)
+// Verbose: kalau true, log full detail. Kalau false, log ringkas (cocok untuk
+// scan banyak ExitProgram-N).
+static bool PatchFuncByString(const char* tag, PBYTE base, DWORD size,
+                              const char* str, bool verbose)
 {
     PBYTE strAddr = FindStrZ(base, size, str);
     if (!strAddr) return false;
 
-    Log("[%s] string '%s' at %p (offset 0x%lX)",
-        tag, str, strAddr, (DWORD)(strAddr - base));
-    LogHex("at-strAddr-32B", strAddr, 32);
+    if (verbose) {
+        Log("[%s] string '%s' at %p (offset 0x%lX)",
+            tag, str, strAddr, (DWORD)(strAddr - base));
+        LogHex("at-strAddr-32B", strAddr, 32);
+    }
 
     int xrefIdx = 0, patched = 0;
     while (xrefIdx < 16) {
-        PBYTE pushSite = FindPushImm32_N(base, size, (DWORD)(DWORD_PTR)strAddr, xrefIdx);
-        if (!pushSite) break;
-        Log("[%s] xref #%d push at %p", tag, xrefIdx, pushSite);
+        PBYTE xrefSite = FindCodeXref_N(base, size, (DWORD)(DWORD_PTR)strAddr, xrefIdx);
+        if (!xrefSite) break;
+        if (verbose)
+            Log("[%s] xref #%d (op=%02X) at %p", tag, xrefIdx, xrefSite[0], xrefSite);
 
-        PBYTE funcStart = FindFuncStartBack(pushSite, 0x1000);
+        PBYTE funcStart = FindFuncStartBack(xrefSite, 0x1000);
         if (!funcStart) {
-            Log("[%s]   no `55 8B EC` prologue within 4KB above", tag);
+            if (verbose) Log("[%s]   no `55 8B EC` prologue within 4KB above", tag);
         } else {
-            Log("[%s]   prologue at %p (-%lu from xref)",
-                tag, funcStart, (DWORD)(pushSite - funcStart));
-            LogHex("orig-16B", funcStart, 16);
-
-            // Cari epilogue fungsi (`5D C3` atau `5D C2 NN NN`) ke depan
-            // dalam range max 8KB. Jika ada, JMP dari prologue ke epilogue
-            // -- stack dibersihkan oleh epilogue natural fungsi.
             PBYTE epilogue = FindFunctionEpilogue(funcStart + 3, 0x2000);
             if (epilogue) {
-                Log("[%s]   epilogue at %p (+%lu from prologue)",
-                    tag, epilogue, (DWORD)(epilogue - funcStart));
-                LogHex("epilogue-bytes", epilogue, 8);
+                if (verbose) {
+                    Log("[%s]   prologue %p, epilogue %p (size=%lu)",
+                        tag, funcStart, epilogue, (DWORD)(epilogue - funcStart));
+                    LogHex("epilogue-bytes", epilogue, 8);
+                }
                 if (PatchJumpRel32(funcStart, epilogue)) {
-                    Log("[%s]   PATCHED (jmp prologue -> epilogue)", tag);
+                    Log("[%s]   PATCHED jmp %p -> %p", tag, funcStart, epilogue);
                     patched++;
                 }
             } else {
-                // Fallback: xor eax,eax; ret (cdecl-friendly tapi rusak utk stdcall)
-                Log("[%s]   no epilogue found, fallback to xor-eax-ret", tag);
+                if (verbose) Log("[%s]   no epilogue found, fallback xor-eax-ret", tag);
                 static const BYTE STUB[] = { 0x31, 0xC0, 0xC3 };
                 if (PatchBytes(funcStart, STUB, sizeof(STUB))) {
                     Log("[%s]   PATCHED (xor eax,eax; ret)", tag);
@@ -291,7 +294,7 @@ static bool PatchFuncByString(const char* tag, PBYTE base, DWORD size, const cha
     return patched > 0;
 }
 
-// ---- Worker: scan + patch (retry sampai found atau timeout) ------------
+// ---- Worker: scan + patch (retry sampai timeout) -----------------------
 static DWORD WINAPI ScanWorker(LPVOID)
 {
     Log("scan worker start");
@@ -305,42 +308,59 @@ static DWORD WINAPI ScanWorker(LPVOID)
     }
     Log("lostsaga.exe: base=%p size=%lu (0x%lX)", base, size, size);
 
+    // Track patched targets to avoid double work.
     bool got_gameMon = false;
-    bool got_exit23  = false;
-    bool got_exit1   = false;
+    bool got_npr     = false;
+    bool got_ggFail  = false;
+    bool got_exitN[64] = {0}; // index by N (1..63)
 
-    // Retry sampai 240 attempts x 250ms = 60 detik max.
     for (int attempt = 0; attempt < 240; ++attempt) {
+        // Patch SEMUA ExitProgram - N variants (1..50).
+        for (int n = 1; n <= 50; ++n) {
+            if (got_exitN[n]) continue;
+            char buf[32];
+            sprintf(buf, "ExitProgram - %d", n);
+            char tag[32];
+            sprintf(tag, "ExitProg%d", n);
+            if (PatchFuncByString(tag, base, size, buf, true))
+                got_exitN[n] = true;
+        }
+
         if (!got_gameMon &&
-            PatchFuncByString("GameMonErr", base, size, "GameMon Error : %d"))
+            PatchFuncByString("GameMonErr", base, size, "GameMon Error : %d", true))
             got_gameMon = true;
 
-        if (!got_exit23 &&
-            PatchFuncByString("ExitProg23", base, size, "ExitProgram - 23"))
-            got_exit23 = true;
+        if (!got_npr &&
+            PatchFuncByString("nProtect", base, size, "[nProtect] - ", true))
+            got_npr = true;
 
-        if (!got_exit1 &&
-            PatchFuncByString("ExitProg1", base, size, "ExitProgram - 1"))
-            got_exit1 = true;
-
-        if (got_gameMon && got_exit23 && got_exit1) {
-            Log("ALL targets patched at attempt #%d", attempt);
-            break;
+        // Sekali saja: dump strings di region 1KB dekat ExitProg23 untuk
+        // discovery string lain (debug only, attempt #2 supaya unpacker selesai).
+        if (attempt == 2) {
+            PBYTE eg23 = FindStrZ(base, size, "ExitProgram - 23");
+            if (eg23) {
+                Log("dumping strings around ExitProgram-23 region:");
+                DumpStringsIn(eg23 - 0x80, 0x400);
+            }
         }
+
+        // Hitung total exit patched.
+        int exitPatched = 0;
+        for (int n = 1; n <= 50; ++n) if (got_exitN[n]) exitPatched++;
 
         if ((attempt % 8) == 0) {
-            Log("attempt #%d: gameMon=%d exit23=%d exit1=%d",
-                attempt, got_gameMon, got_exit23, got_exit1);
+            Log("attempt #%d: gameMon=%d npr=%d exitN_patched=%d",
+                attempt, got_gameMon, got_npr, exitPatched);
         }
+
         Sleep(250);
     }
 
-    Log("scan worker done. gameMon=%d exit23=%d exit1=%d",
-        got_gameMon, got_exit23, got_exit1);
+    Log("scan worker timeout");
     return 0;
 }
 
-// ---- GG kill loop (parallel thread) ------------------------------------
+// ---- GG kill loop ------------------------------------------------------
 static DWORD WINAPI GGKillLoop(LPVOID)
 {
     CTools tools;
