@@ -341,19 +341,33 @@ static LONG WINAPI MyVEH(PEXCEPTION_POINTERS info)
     }
 
     // ---- Hatch: NULL deref ----
-    // Strategi: kalau AV READ @ NULL, replace SEMUA register GP yang
-    // bernilai 0 menjadi pointer ke buffer kosong 16-byte aligned.
-    // Instruksi yang gagal akan resume dan baca dari buffer ini (zeros),
-    // sehingga string function / SSE read berjalan tanpa crash.
-    //
-    // Counter mencegah infinite loop bila fix tidak benar-benar
-    // menyelesaikan masalah pada EIP yang sama.
     if (rec->ExceptionCode == EXCEPTION_ACCESS_VIOLATION
-        && rec->ExceptionInformation[0] == 0   // READ
-        && rec->ExceptionInformation[1] == 0)  // @ NULL
+        && rec->ExceptionInformation[0] == 0)  // READ
     {
+        DWORD faultAddr = (DWORD)rec->ExceptionInformation[1];
         int n = HatchCount((DWORD)(DWORD_PTR)rec->ExceptionAddress);
-        if (n <= 50) {
+
+        if (n > 30) {
+            Log("  HATCH: gave up after 30 tries at this EIP, forwarding to default handler");
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+
+        // Pattern 1: REP MOV/STOS dengan source/dest invalid -> set ECX=0,
+        // skip instruksi (advance EIP 2 byte).
+        if (eip[0] == 0xF3 &&
+            (eip[1] == 0xA4 || eip[1] == 0xA5 ||  // rep movsb / rep movsd
+             eip[1] == 0xAA || eip[1] == 0xAB ||  // rep stosb / rep stosd
+             eip[1] == 0xAE || eip[1] == 0xAF))   // repe scasb / repe scasd
+        {
+            ctx->Ecx = 0;
+            ctx->Eip += 2; // skip F3 + opcode
+            Log("  HATCH: REP STR* with invalid pointer, skipped (ECX=0, EIP+=2)");
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+
+        // Pattern 2: AV READ @ NULL -> redirect register ke empty buffer.
+        // Hanya register yang nilainya 0 yang di-redirect.
+        if (faultAddr == 0) {
             DWORD emptyAddr = (DWORD)(DWORD_PTR)g_emptyStr;
             DWORD* gp[8] = {
                 &ctx->Eax, &ctx->Ecx, &ctx->Edx, &ctx->Ebx,
@@ -361,17 +375,15 @@ static LONG WINAPI MyVEH(PEXCEPTION_POINTERS info)
             };
             int fixed = 0;
             for (int i = 0; i < 8; ++i) {
-                if (i == 4) continue; // jangan sentuh ESP, akan rusak frame
+                if (i == 4) continue; // jangan sentuh ESP
                 if (*gp[i] == 0) {
                     *gp[i] = emptyAddr;
                     fixed++;
                 }
             }
-            Log("  HATCH: redirected %d NULL registers to empty buffer @ %p (try #%d at this EIP)",
+            Log("  HATCH: redirected %d NULL registers to empty buffer @ %p (try #%d)",
                 fixed, (void*)emptyAddr, n);
             return EXCEPTION_CONTINUE_EXECUTION;
-        } else {
-            Log("  HATCH: gave up after 50 tries at this EIP, forwarding to default handler");
         }
     }
 
