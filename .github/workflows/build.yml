@@ -1,0 +1,44 @@
+name: Build KRNProtectBypass
+
+on:
+  push:
+  workflow_dispatch: # bisa dijalankan manual dari tab Actions
+
+jobs:
+  build:
+    runs-on: windows-2022
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      # DLL injeksi 32-bit (Lost Saga client x86). Toolset v143 = VS 2022.
+      - name: Build (Win32 / Release)
+        shell: cmd
+        run: >
+          msbuild KRNProtectBypass.vcxproj
+          /p:Configuration=Release
+          /p:Platform=Win32
+          /p:PlatformToolset=v143
+          /p:WindowsTargetPlatformVersion=10.0
+          /p:VcpkgEnabled=false
+          /m
+
+      # Buat copy dengan nama xinput1_3.dll (proxy DLL drop-in untuk folder game).
+      - name: Stage proxy DLL (xinput1_3.dll)
+        shell: cmd
+        run: |
+          if exist Release\KRNProtectBypass.dll copy /Y Release\KRNProtectBypass.dll Release\xinput1_3.dll
+
+      - name: Upload KRNProtectBypass.dll
+        uses: actions/upload-artifact@v4
+        with:
+          name: KRNProtectBypass
+          path: |
+            **/Release/KRNProtectBypass.dll
+            **/Release/KRNProtectBypass.pdb
+            **/Release/xinput1_3.dll
+          if-no-files-found: error
