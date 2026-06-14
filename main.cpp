@@ -213,6 +213,33 @@ static bool PatchBytes(PBYTE addr, const BYTE* bytes, DWORD len)
     return true;
 }
 
+// Scan forward dari `start` cari epilogue `5D C3` (pop ebp; ret) atau
+// `5D C2 NN NN` (pop ebp; ret imm16). Itu ujung natural fungsi -- stack
+// di-restore dengan benar tanpa kita perlu tahu calling convention.
+static PBYTE FindFunctionEpilogue(PBYTE start, DWORD maxScan)
+{
+    for (DWORD i = 0; i < maxScan; ++i) {
+        PBYTE p = start + i;
+        __try {
+            if (p[0] == 0x5D && (p[1] == 0xC3 || p[1] == 0xC2))
+                return p;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {
+            return NULL;
+        }
+    }
+    return NULL;
+}
+
+// Tulis JMP rel32 dari `from` ke `to` (5 byte: E9 + 4-byte offset).
+static bool PatchJumpRel32(PBYTE from, PBYTE to)
+{
+    INT32 rel = (INT32)((PBYTE)to - (from + 5));
+    BYTE patch[5] = { 0xE9, 0, 0, 0, 0 };
+    memcpy(patch + 1, &rel, 4);
+    return PatchBytes(from, patch, 5);
+}
+
 // ---- Patch via string xref ---------------------------------------------
 static bool PatchFuncByString(const char* tag, PBYTE base, DWORD size, const char* str)
 {
@@ -223,7 +250,6 @@ static bool PatchFuncByString(const char* tag, PBYTE base, DWORD size, const cha
         tag, str, strAddr, (DWORD)(strAddr - base));
     LogHex("at-strAddr-32B", strAddr, 32);
 
-    static const BYTE STUB[] = { 0x31, 0xC0, 0xC3 }; // xor eax,eax; ret
     int xrefIdx = 0, patched = 0;
     while (xrefIdx < 16) {
         PBYTE pushSite = FindPushImm32_N(base, size, (DWORD)(DWORD_PTR)strAddr, xrefIdx);
@@ -237,9 +263,27 @@ static bool PatchFuncByString(const char* tag, PBYTE base, DWORD size, const cha
             Log("[%s]   prologue at %p (-%lu from xref)",
                 tag, funcStart, (DWORD)(pushSite - funcStart));
             LogHex("orig-16B", funcStart, 16);
-            if (PatchBytes(funcStart, STUB, sizeof(STUB))) {
-                Log("[%s]   PATCHED", tag);
-                patched++;
+
+            // Cari epilogue fungsi (`5D C3` atau `5D C2 NN NN`) ke depan
+            // dalam range max 8KB. Jika ada, JMP dari prologue ke epilogue
+            // -- stack dibersihkan oleh epilogue natural fungsi.
+            PBYTE epilogue = FindFunctionEpilogue(funcStart + 3, 0x2000);
+            if (epilogue) {
+                Log("[%s]   epilogue at %p (+%lu from prologue)",
+                    tag, epilogue, (DWORD)(epilogue - funcStart));
+                LogHex("epilogue-bytes", epilogue, 8);
+                if (PatchJumpRel32(funcStart, epilogue)) {
+                    Log("[%s]   PATCHED (jmp prologue -> epilogue)", tag);
+                    patched++;
+                }
+            } else {
+                // Fallback: xor eax,eax; ret (cdecl-friendly tapi rusak utk stdcall)
+                Log("[%s]   no epilogue found, fallback to xor-eax-ret", tag);
+                static const BYTE STUB[] = { 0x31, 0xC0, 0xC3 };
+                if (PatchBytes(funcStart, STUB, sizeof(STUB))) {
+                    Log("[%s]   PATCHED (xor eax,eax; ret)", tag);
+                    patched++;
+                }
             }
         }
         xrefIdx++;
